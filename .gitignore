@@ -1,0 +1,11 @@
+.env
+token.json
+credentials.json
+input_calls/
+processed/
+call_metadata/
+logs.txt
+venv/
+__pycache__/
+content_lake/
+.DS_Store
