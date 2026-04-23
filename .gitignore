@@ -9,3 +9,4 @@ venv/
 __pycache__/
 content_lake/
 .DS_Store
+token.txt

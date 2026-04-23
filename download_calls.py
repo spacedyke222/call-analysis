@@ -4,6 +4,7 @@ import os
 import requests
 import json
 import time
+import random
 from datetime import datetime, timedelta, timezone
 
 load_dotenv()
@@ -20,35 +21,55 @@ rcsdk = SDK(
     os.environ.get("RC_SERVER_URL")
 )
 
-_platform = None  # singleton cache
+_platform = None
 
 
 def get_platform():
-    """
-    Create and cache a single authenticated RingCentral platform instance.
-    Prevents repeated login calls that cause 429 rate limits.
-    """
     global _platform
 
     if _platform is None:
-        try:
-            _platform = rcsdk.platform()
-            _platform.login(jwt=os.environ.get("RC_USER_JWT"))
-            print("Log in successful.")
-        except Exception as e:
-            print(f"Login failed: {e}")
-            raise e
+        _platform = rcsdk.platform()
+        _platform.login(jwt=os.environ.get("RC_USER_JWT"))
+        print("Login successful.")
 
     return _platform
 
 
 # ----------------------------
-# CALL FETCHING
+# STATE (CURSOR TRACKING)
 # ----------------------------
 
-def get_recent_calls(platform, retries=5):
-    now = datetime.now(timezone.utc)
-    date_from = (now - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
+STATE_FILE = "state.json"
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"last_sync": None}
+
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+# ----------------------------
+# CALL FETCHING (DELTA SAFE)
+# ----------------------------
+
+def get_recent_calls(platform, last_sync=None, retries=5):
+    """
+    Only fetch calls since last successful run.
+    Prevents unnecessary API load.
+    """
+
+    if last_sync:
+        date_from = last_sync
+    else:
+        now = datetime.now(timezone.utc)
+        date_from = (now - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     print(f"DEBUG: Requesting calls since {date_from}")
 
@@ -66,37 +87,38 @@ def get_recent_calls(platform, retries=5):
             return response
 
         except Exception as e:
-            print(f"❌ RingCentral API Error: {e}")
+            wait = (2 ** i) + random.uniform(0, 1)
 
-            if hasattr(e, 'response'):
-                print(f"Details: {e.response.text}")
+            print(f"❌ API error: {e}")
+            print(f"Retrying in {wait:.1f}s...")
 
-            wait = 2 ** i
-            print(f"Retry {i+1}/{retries} in {wait}s...")
             time.sleep(wait)
 
     return None
 
 
 # ----------------------------
-# MAIN DOWNLOAD PIPELINE
+# MAIN PIPELINE
 # ----------------------------
 
 def run_download_cycle():
     os.makedirs("input_calls", exist_ok=True)
     os.makedirs("call_metadata", exist_ok=True)
 
+    state = load_state()
     platform = get_platform()
 
-    response = get_recent_calls(platform)
+    response = get_recent_calls(platform, state.get("last_sync"))
+
     if not response:
-        print("Could not fetch logs from RingCentral.")
+        print("Failed to fetch calls.")
         return
 
     calls = response.json().records
     token = platform.auth().data()["access_token"]
 
     new_downloads = 0
+    newest_timestamp = state.get("last_sync")
 
     for call in calls:
         try:
@@ -113,17 +135,23 @@ def run_download_cycle():
             file_path = os.path.join("input_calls", f"{recording_id}.mp3")
             meta_path = os.path.join("call_metadata", f"{recording_id}.json")
 
-            # Skip already processed calls
+            # Skip if already exists
             if os.path.exists(file_path):
                 continue
 
-            # ----------------------------
-            # METADATA
-            # ----------------------------
+            start_time = getattr(call, "startTime", None)
+
+            # Track newest timestamp
+            if start_time:
+                newest_timestamp = max(
+                    newest_timestamp or start_time,
+                    start_time
+                )
+
             metadata = {
                 "recording_id": recording_id,
                 "direction": getattr(call, "direction", "Unknown"),
-                "start_time": getattr(call, "startTime", None),
+                "start_time": start_time,
                 "from": getattr(call, "from", {}),
                 "to": getattr(call, "to", {}),
                 "duration": getattr(call, "duration", None)
@@ -132,9 +160,6 @@ def run_download_cycle():
             with open(meta_path, "w") as mf:
                 json.dump(metadata, mf, indent=2, default=str)
 
-            # ----------------------------
-            # DOWNLOAD RECORDING
-            # ----------------------------
             r = requests.get(
                 url,
                 headers={"Authorization": f"Bearer {token}"},
@@ -145,26 +170,33 @@ def run_download_cycle():
                 with open(file_path, "wb") as f:
                     f.write(r.content)
 
-                print(f"✅ Downloaded: {recording_id} ({metadata['direction']})")
+                print(f"Downloaded: {recording_id}")
                 new_downloads += 1
 
             elif r.status_code == 429:
                 retry_after = int(r.headers.get("Retry-After", 60))
-                print(f"⚠️ Rate limited. Waiting {retry_after}s...")
+                retry_after += random.uniform(0, 3)
+
+                print(f"Rate limited. Sleeping {retry_after:.1f}s")
                 time.sleep(retry_after)
                 break
 
         except Exception as e:
-            print(f"❌ Error processing record {getattr(call, 'id', 'unknown')}: {e}")
+            print(f"Error: {e}")
 
-    if new_downloads == 0:
-        print("No new recordings found since last check.")
-    else:
-        print(f"Finished. Total new calls downloaded: {new_downloads}")
+    # ----------------------------
+    # UPDATE STATE
+    # ----------------------------
+
+    if newest_timestamp:
+        state["last_sync"] = newest_timestamp
+        save_state(state)
+
+    print(f"Done. New downloads: {new_downloads}")
 
 
 # ----------------------------
-# ENTRYPOINT
+# ENTRY
 # ----------------------------
 
 if __name__ == "__main__":
